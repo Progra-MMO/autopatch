@@ -1,0 +1,17 @@
+# Gestionado por Ansible (skill dnf-automatic-redhat)
+[commands]
+upgrade_type = {{ dnf_upgrade_type }}
+random_sleep = 0
+network_online_timeout = 60
+download_updates = yes
+apply_updates = {{ 'yes' if dnf_apply_updates | bool else 'no' }}
+reboot = never
+
+[emitters]
+# El correo lo maneja patch-report (mail individual o consolidado),
+# asi que dnf-automatic solo deja registro en el journal.
+system_name = {{ ansible_fqdn | default(ansible_hostname) }}
+emit_via = stdio
+
+[base]
+debuglevel = 1

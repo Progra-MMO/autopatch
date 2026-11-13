@@ -1,0 +1,18 @@
+---
+# Configura el MTA local como smarthost que reenvia al SMTP corporativo.
+# El SMTP se pasa por la variable smtp_server.
+
+- name: Validar que smtp_server este definido
+  ansible.builtin.assert:
+    that:
+      - smtp_server is defined
+      - smtp_server | length > 0
+    fail_msg: "Debes definir la variable smtp_server (servidor SMTP corporativo)."
+
+- name: Configurar sendmail como smarthost
+  ansible.builtin.include_tasks: sendmail.yml
+  when: mail_mta == 'sendmail'
+
+- name: Configurar postfix como smarthost
+  ansible.builtin.include_tasks: postfix.yml
+  when: mail_mta == 'postfix'

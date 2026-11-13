@@ -1,0 +1,234 @@
+---
+# =====================================================================
+#  06 - PATCH REPORT (reporte por servidor)
+#  Instala en CADA servidor el script patch-report.sh que arma el
+#  fragmento HTML con el estado del parcheo (dnf-automatic, kpatch,
+#  reinicio pendiente, kernels viejos, chequeos de apps).
+#  Playbook INDEPENDIENTE (script embebido, no usa templates/).
+#
+#  Modos (variable report_mode):
+#    pull    -> (default) escribe el fragmento en report_file; el
+#               Servidor 1 lo recoge por SSH. Ajusta propiedad/permisos
+#               para que se pueda leer/descargar desde el Servidor 1.
+#    local   -> manda un mail HTML por servidor (via sendmail).
+#    central -> empuja el fragmento al colector por scp (push).
+#
+#  Ejecucion:
+#    ansible-playbook -i inventario 06-patch_report.yml
+#    ansible-playbook -i inventario 06-patch_report.yml -e report_mode=local -e report_to=infra@cliente.com
+#
+#  Variables principales:
+#    report_mode     pull | local | central   (default pull)
+#    report_file     default /tmp/patch-report/latest.html
+#    report_owner    dueno del archivo en modo pull (default svc-ar-checklist)
+#    report_to       destinatario (modo local)
+#    mail_from       remitente (modo local)
+#    app_checks      lista de {name, command} para chequear apps
+#    collector_*     parametros del colector (modo central)
+# =====================================================================
+- name: Instalar reporte de parcheo por servidor
+  hosts: "{{ target_hosts | default('redhat_servers') }}"
+  become: true
+  vars:
+    report_mode: pull
+    report_file: "/tmp/patch-report/latest.html"
+    report_owner: "svc-ar-checklist"
+    report_to: "infraestructura@empresa.com"
+    mail_from: "parcheo@{{ ansible_fqdn | default(ansible_hostname) }}"
+    collector_host: "collector.empresa.local"
+    collector_user: "patchrpt"
+    collector_spool: "/var/spool/patch-reports/incoming"
+    collector_ssh_key: "/root/.ssh/id_patchreport"
+    app_checks: []
+  tasks:
+    - name: Instalar dependencias del reporte
+      ansible.builtin.package:
+        name:
+          - yum-utils        # provee needs-restarting
+          - openssh-clients  # provee scp (modo central)
+        state: present
+
+    - name: Instalar archivo de configuracion del reporte
+      ansible.builtin.copy:
+        dest: /etc/patch-report.conf
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          # Gestionado por Ansible (skill dnf-automatic-redhat)
+          REPORT_MODE={{ report_mode }}
+          REPORT_FILE={{ report_file }}
+          REPORT_OWNER={{ report_owner }}
+          REPORT_TO={{ report_to }}
+          MAIL_FROM={{ mail_from }}
+          COLLECTOR_HOST={{ collector_host }}
+          COLLECTOR_USER={{ collector_user }}
+          COLLECTOR_SPOOL={{ collector_spool }}
+          COLLECTOR_SSH_KEY={{ collector_ssh_key }}
+
+    - name: Instalar script patch-report.sh
+      ansible.builtin.copy:
+        dest: /usr/local/sbin/patch-report.sh
+        owner: root
+        group: root
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          # ---------------------------------------------------------------------
+          #  patch-report.sh  (generado por el skill dnf-automatic-redhat)
+          #  Recolecta el estado del parcheo de ESTE servidor y, segun el modo:
+          #    - local   -> envia un mail HTML directo (via sendmail)
+          #    - central -> empuja un fragmento HTML al colector por scp (push)
+          #    - pull    -> escribe el fragmento en un archivo local; el Servidor 1
+          #                 lo recoge por SSH (no manda mail, no usa scp)
+          #  Flag:
+          #    --stdout  -> imprime el fragmento por salida estandar y termina
+          # ---------------------------------------------------------------------
+          set -uo pipefail
+
+          STDOUT_ONLY=0
+          [ "${1:-}" = "--stdout" ] && STDOUT_ONLY=1
+
+          CONF=/etc/patch-report.conf
+          [ -f "$CONF" ] && . "$CONF"
+
+          REPORT_MODE="${REPORT_MODE:-local}"
+          REPORT_FILE="${REPORT_FILE:-/tmp/patch-report/latest.html}"
+          REPORT_OWNER="${REPORT_OWNER:-}"
+          HOST="$(hostname -f 2>/dev/null || hostname)"
+          NOW="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+          TODAY="$(date '+%Y-%m-%d')"
+
+          # --- Estado global del parcheo ---------------------------------------
+          if systemctl is-failed --quiet dnf-automatic.service; then
+              OVERALL="FALLO"
+          else
+              OVERALL="OK"
+          fi
+          DA_STATE="$(systemctl show -p Result --value dnf-automatic.service 2>/dev/null || echo n/d)"
+
+          # --- Datos del parcheo ----------------------------------------------
+          UPDATED="$(dnf history list last 2>/dev/null | sed -n '3p' | sed 's/  */ /g')"
+          LAST_PKGS="$(dnf history info last 2>/dev/null | sed -n '/Packages Altered/,$p' | head -n 80)"
+          SEC_PENDING="$(dnf -q updateinfo list security --available 2>/dev/null | grep -c . || echo 0)"
+
+          # --- Reinicio requerido ---------------------------------------------
+          if command -v needs-restarting >/dev/null 2>&1; then
+              if needs-restarting -r >/dev/null 2>&1; then REBOOT="No"; else REBOOT="Si"; fi
+          else
+              REBOOT="n/d"
+          fi
+
+          # --- kpatch ----------------------------------------------------------
+          if command -v kpatch >/dev/null 2>&1; then
+              KPATCH="$(kpatch list 2>/dev/null | grep -v '^Loaded\|^Installed\|^$' | tr '\n' ' ')"
+              [ -z "$KPATCH" ] && KPATCH="ninguno activo"
+          else
+              KPATCH="no instalado"
+          fi
+
+          # --- Kernels viejos removibles --------------------------------------
+          OLDK="$(dnf repoquery --installonly --latest-limit=-1 -q 2>/dev/null | grep -c . || echo 0)"
+          RUNK="$(uname -r)"
+
+          # --- Chequeos de aplicaciones ---------------------------------------
+          APP_ROWS=""
+          {% for c in app_checks %}
+          OUT="$({{ c.command }} 2>&1)"; RC=$?
+          if [ $RC -eq 0 ]; then AST="OK"; ACL="ok"; else AST="FALLO"; ACL="fail"; OVERALL="FALLO"; fi
+          APP_ROWS="${APP_ROWS}<tr><td>{{ c.name }}</td><td class=\"$ACL\">$AST</td><td><code>$(printf '%s' "$OUT" | head -c 200)</code></td></tr>"
+          {% endfor %}
+
+          # --- Fragmento HTML del host ----------------------------------------
+          BADGE=$([ "$OVERALL" = "OK" ] && echo ok || echo fail)
+          read -r -d '' FRAG <<EOF
+          <section class="host">
+            <h2>${HOST} <span class="badge ${BADGE}">${OVERALL}</span></h2>
+            <table>
+              <tr><td>Fecha</td><td>${NOW}</td></tr>
+              <tr><td>Kernel en ejecucion</td><td>${RUNK}</td></tr>
+              <tr><td>Resultado dnf-automatic</td><td>${DA_STATE}</td></tr>
+              <tr><td>Ultima transaccion</td><td>${UPDATED:-sin cambios}</td></tr>
+              <tr><td>Updates de seguridad pendientes</td><td>${SEC_PENDING}</td></tr>
+              <tr><td>Requiere reinicio</td><td>${REBOOT}</td></tr>
+              <tr><td>kpatch activos</td><td>${KPATCH}</td></tr>
+              <tr><td>Kernels viejos removibles</td><td>${OLDK}</td></tr>
+            </table>
+          EOF
+          if [ -n "$APP_ROWS" ]; then
+              FRAG="${FRAG}<h3>Aplicaciones</h3><table><tr><th>App</th><th>Estado</th><th>Detalle</th></tr>${APP_ROWS}</table>"
+          fi
+          FRAG="${FRAG}<details><summary>Paquetes alterados</summary><pre>$(printf '%s' "$LAST_PKGS")</pre></details></section>"
+
+          STYLE='body{font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#222}
+          h1{font-size:18px}h2{font-size:15px;border-bottom:2px solid #ccc}
+          table{border-collapse:collapse;margin:6px 0}td,th{border:1px solid #ddd;padding:3px 8px}
+          .badge{padding:2px 8px;border-radius:4px;color:#fff;font-size:12px}
+          .ok{background:#2e7d32}.fail{background:#c62828}
+          td.ok{color:#2e7d32;font-weight:bold}td.fail{color:#c62828;font-weight:bold}
+          code{background:#f4f4f4;padding:1px 3px}'
+
+          # --- Entrega ---------------------------------------------------------
+          if [ "$STDOUT_ONLY" -eq 1 ]; then
+              printf '%s\n' "$FRAG"
+              exit 0
+          fi
+
+          if [ "$REPORT_MODE" = "pull" ]; then
+              # Modo pull: dejamos el fragmento en un archivo local. El Servidor 1
+              # lo recoge por SSH. Ajustamos propiedad/permisos para que sea
+              # legible/descargable desde el Servidor 1.
+              DIR="$(dirname "$REPORT_FILE")"
+              mkdir -p "$DIR"
+              printf '%s\n' "$FRAG" > "$REPORT_FILE"
+              chmod 0755 "$DIR" 2>/dev/null || true
+              chmod 0644 "$REPORT_FILE" 2>/dev/null || true
+              if [ -n "$REPORT_OWNER" ]; then
+                  chown "$REPORT_OWNER":"$REPORT_OWNER" "$REPORT_FILE" 2>/dev/null || true
+              fi
+              logger -t patch-report "Reporte de ${HOST} escrito en ${REPORT_FILE} (${OVERALL})"
+          elif [ "$REPORT_MODE" = "central" ]; then
+              TMP="$(mktemp)"
+              printf '%s\n' "$FRAG" > "$TMP"
+              if scp -q -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+                      -i "${COLLECTOR_SSH_KEY}" \
+                      "$TMP" "${COLLECTOR_USER}@${COLLECTOR_HOST}:${COLLECTOR_SPOOL}/${HOST}__${TODAY}.html"; then
+                  logger -t patch-report "Reporte de ${HOST} enviado al colector (${OVERALL})"
+              else
+                  logger -t patch-report "ERROR: no se pudo enviar el reporte al colector"
+              fi
+              rm -f "$TMP"
+          else
+              {
+                  echo "To: ${REPORT_TO}"
+                  echo "From: ${MAIL_FROM}"
+                  echo "Subject: [Parcheo ${OVERALL}] ${HOST} ${TODAY}"
+                  echo "MIME-Version: 1.0"
+                  echo "Content-Type: text/html; charset=UTF-8"
+                  echo
+                  echo "<html><head><meta charset=\"utf-8\"><style>${STYLE}</style></head><body>"
+                  echo "<h1>Checklist de parcheo &mdash; ${HOST}</h1>"
+                  printf '%s\n' "$FRAG"
+                  echo "</body></html>"
+              } | /usr/sbin/sendmail -t -i
+              logger -t patch-report "Reporte de ${HOST} enviado por mail a ${REPORT_TO} (${OVERALL})"
+          fi
+
+    - name: Instalar unidad patch-report.service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/patch-report.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Genera y envia/empuja el reporte de parcheo
+          After=dnf-automatic.service network-online.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/patch-report.sh
+      register: pr_unit
+
+    - name: Recargar systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: pr_unit.changed

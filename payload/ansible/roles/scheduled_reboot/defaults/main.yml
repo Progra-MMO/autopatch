@@ -1,0 +1,3 @@
+---
+reboot_scheduled: true
+reboot_oncalendar: "Sat *-*-* 15:00:00"

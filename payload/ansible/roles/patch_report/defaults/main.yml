@@ -1,0 +1,16 @@
+---
+report_mode: pull
+report_file: "/tmp/patch-report/latest.html"
+# Dueno/permisos del latest.html en modo pull (para que el xtk lo descargue).
+# Para permisos 777: -e report_file_mode=0777 (y opcional -e report_owner="")
+report_owner: "usuario-servicio"
+report_group: ""
+report_file_mode: "0644"
+report_dir_mode: "0755"
+report_to: "infraestructura@empresa.com"
+mail_from: "parcheo@{{ ansible_fqdn | default(ansible_hostname) }}"
+collector_host: "collector.empresa.local"
+collector_user: "patchrpt"
+collector_spool: "/var/spool/patch-reports/incoming"
+collector_ssh_key: "/root/.ssh/id_patchreport"
+app_checks: []

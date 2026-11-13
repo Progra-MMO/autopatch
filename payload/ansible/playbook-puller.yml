@@ -1,0 +1,16 @@
+---
+# Playbook del SERVIDOR 1 (modo pull).
+# Configura el host que recoge por SSH los reportes de todos los servers,
+# los concatena en un unico HTML y envia UN solo mail diario.
+# Usa la clave SSH que el Servidor 1 YA tiene hacia los targets.
+# No crea usuarios en ningun lado.
+#
+# Uso:
+#   ansible-playbook playbook-puller.yml
+#
+- name: Configurar Servidor 1 (puller de reportes de parcheo)
+  hosts: puller
+  become: true
+  roles:
+    - role: mail_relay      # el Servidor 1 necesita salida SMTP para el mail
+    - role: patch_puller

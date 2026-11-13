@@ -1,0 +1,192 @@
+---
+# =====================================================================
+#  08 - PATCH COLLECTOR (modo push, ALTERNATIVO al puller)
+#  Corre en el colector central. Recibe por scp los fragmentos que cada
+#  servidor empuja (patch-report en modo central), consolida y envia UN
+#  unico mail. Playbook INDEPENDIENTE (script embebido).
+#
+#  OJO: este modo CREA un usuario de servicio en el colector para recibir
+#  el scp. Si no queres crear usuarios, usa el modo pull (07-patch_puller).
+#
+#  Ejecucion:
+#    ansible-playbook -i inventario 08-patch_collector.yml -e target_hosts=collector
+#
+#  Variables principales:
+#    collector_user            usuario de servicio (default patchrpt)
+#    collector_spool/archive   directorios de recepcion/archivo
+#    collector_oncalendar      default "*-*-* 23:40:00"
+#    collector_authorized_keys lista de claves publicas de los servidores
+#    report_to / mail_from     destino y remitente del mail consolidado
+# =====================================================================
+- name: Configurar colector central (modo push)
+  hosts: "{{ target_hosts | default('collector') }}"
+  become: true
+  vars:
+    collector_user: "patchrpt"
+    collector_spool: "/var/spool/patch-reports/incoming"
+    collector_archive: "/var/spool/patch-reports/archive"
+    collector_oncalendar: "*-*-* 23:40:00"
+    report_to: "infraestructura@empresa.com"
+    mail_from: "parcheo@{{ ansible_fqdn | default(ansible_hostname) }}"
+    collector_authorized_keys: []
+  tasks:
+    - name: Crear usuario del colector
+      ansible.builtin.user:
+        name: "{{ collector_user }}"
+        system: true
+        shell: /bin/bash
+        home: "/home/{{ collector_user }}"
+        create_home: true
+
+    - name: Crear directorios de spool y archivo
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ collector_user }}"
+        group: "{{ collector_user }}"
+        mode: '0750'
+      loop:
+        - "{{ collector_spool }}"
+        - "{{ collector_archive }}"
+
+    - name: Crear .ssh del usuario colector
+      ansible.builtin.file:
+        path: "/home/{{ collector_user }}/.ssh"
+        state: directory
+        owner: "{{ collector_user }}"
+        group: "{{ collector_user }}"
+        mode: '0700'
+
+    - name: Autorizar claves de los servidores (para el scp entrante)
+      ansible.posix.authorized_key:
+        user: "{{ collector_user }}"
+        key: "{{ item }}"
+        state: present
+      loop: "{{ collector_authorized_keys }}"
+      when: collector_authorized_keys | length > 0
+
+    - name: Instalar build-report.py
+      ansible.builtin.copy:
+        dest: /usr/local/sbin/build-report.py
+        owner: root
+        group: root
+        mode: '0755'
+        content: |
+          #!/usr/bin/env python3
+          # ---------------------------------------------------------------------
+          #  build-report.py  (skill dnf-automatic-redhat - colector push)
+          #  Toma los fragmentos HTML que dejaron los servidores en el spool,
+          #  arma UN solo checklist HTML y envia UN unico mail. Luego archiva.
+          # ---------------------------------------------------------------------
+          import os, glob, datetime, subprocess
+
+          SPOOL   = "{{ collector_spool }}"
+          ARCHIVE = "{{ collector_archive }}"
+          REPORT_TO = "{{ report_to }}"
+          MAIL_FROM = "{{ mail_from }}"
+
+          today = datetime.date.today().isoformat()
+          now   = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+          files = sorted(glob.glob(os.path.join(SPOOL, "*.html")))
+
+          STYLE = """body{font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#222}
+          h1{font-size:20px}h2{font-size:15px;border-bottom:2px solid #ccc}
+          table{border-collapse:collapse;margin:6px 0}td,th{border:1px solid #ddd;padding:3px 8px}
+          .badge{padding:2px 8px;border-radius:4px;color:#fff;font-size:12px}
+          .ok{background:#2e7d32}.fail{background:#c62828}
+          td.ok{color:#2e7d32;font-weight:bold}td.fail{color:#c62828;font-weight:bold}
+          .summary td{font-weight:bold}code{background:#f4f4f4;padding:1px 3px}"""
+
+          rows, sections, n_ok, n_fail = [], [], 0, 0
+          for f in files:
+              frag = open(f, encoding="utf-8", errors="replace").read()
+              host = os.path.basename(f).split("__")[0]
+              status = "FALLO" if 'badge fail' in frag else "OK"
+              cls = "fail" if status == "FALLO" else "ok"
+              if status == "OK":
+                  n_ok += 1
+              else:
+                  n_fail += 1
+              rows.append(f'<tr><td>{host}</td><td class="{cls}">{status}</td></tr>')
+              sections.append(frag)
+
+          total = len(files)
+          header = (
+              f"<h1>Checklist diario de parcheo &mdash; {today}</h1>"
+              f"<p>Generado {now} &middot; {total} servidores "
+              f"(<span class='ok'>&nbsp;{n_ok} OK&nbsp;</span> "
+              f"<span class='fail'>&nbsp;{n_fail} con fallas&nbsp;</span>)</p>"
+              "<h2>Resumen</h2>"
+              "<table class='summary'><tr><th>Servidor</th><th>Estado</th></tr>"
+              + "".join(rows) + "</table>"
+          )
+          if total == 0:
+              header += "<p><b>No se recibio ningun reporte hoy.</b> Revisar conectividad/scp de los servidores.</p>"
+
+          body = (
+              f"<html><head><meta charset='utf-8'><style>{STYLE}</style></head><body>"
+              + header + "<h2>Detalle por servidor</h2>" + "".join(sections)
+              + "</body></html>"
+          )
+
+          subject = f"[Parcheo diario] {today} - {n_ok} OK / {n_fail} fallas ({total} servers)"
+          msg = (
+              f"To: {REPORT_TO}\n"
+              f"From: {MAIL_FROM}\n"
+              f"Subject: {subject}\n"
+              "MIME-Version: 1.0\n"
+              "Content-Type: text/html; charset=UTF-8\n\n"
+              + body
+          )
+
+          subprocess.run(["/usr/sbin/sendmail", "-t", "-i"], input=msg.encode("utf-8"))
+
+          if files:
+              dest = os.path.join(ARCHIVE, today)
+              os.makedirs(dest, exist_ok=True)
+              for f in files:
+                  os.rename(f, os.path.join(dest, os.path.basename(f)))
+
+          print(f"Checklist enviado a {REPORT_TO}: {total} servers, {n_fail} fallas.")
+
+    - name: Instalar servicio de consolidacion
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/patch-consolidate.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Consolidar reportes de parcheo y enviar checklist unico
+          After=network-online.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/build-report.py
+      register: cc_service
+
+    - name: Instalar timer de consolidacion ({{ collector_oncalendar }})
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/patch-consolidate.timer
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Timer de consolidacion de reportes de parcheo
+
+          [Timer]
+          OnCalendar={{ collector_oncalendar }}
+          Persistent=true
+
+          [Install]
+          WantedBy=timers.target
+      register: cc_timer
+
+    - name: Recargar systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: cc_service.changed or cc_timer.changed
+
+    - name: Habilitar y arrancar el timer de consolidacion
+      ansible.builtin.systemd:
+        name: patch-consolidate.timer
+        enabled: true
+        state: started

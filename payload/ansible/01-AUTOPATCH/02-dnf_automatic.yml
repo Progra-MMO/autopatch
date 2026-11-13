@@ -1,0 +1,94 @@
+---
+# =====================================================================
+#  02 - DNF-AUTOMATIC (parcheo diario)
+#  Instala y configura dnf-automatic para parchear todos los dias a las
+#  23:00 (configurable). Playbook INDEPENDIENTE.
+#
+#  Ejecucion:
+#    ansible-playbook -i inventario 02-dnf_automatic.yml
+#
+#  Variables:
+#    patch_oncalendar   default "*-*-* 23:00:00"
+#    dnf_upgrade_type   default | security   (default default)
+#    dnf_apply_updates  true/false           (default true)
+# =====================================================================
+- name: Configurar dnf-automatic (parcheo diario)
+  hosts: "{{ target_hosts | default('redhat_servers') }}"
+  become: true
+  vars:
+    patch_oncalendar: "*-*-* 23:00:00"
+    dnf_upgrade_type: default
+    dnf_apply_updates: true
+  tasks:
+    - name: Instalar dnf-automatic
+      ansible.builtin.package:
+        name: dnf-automatic
+        state: present
+
+    - name: Configurar /etc/dnf/automatic.conf
+      ansible.builtin.copy:
+        dest: /etc/dnf/automatic.conf
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          # Gestionado por Ansible (skill dnf-automatic-redhat)
+          [commands]
+          upgrade_type = {{ dnf_upgrade_type }}
+          random_sleep = 0
+          network_online_timeout = 60
+          download_updates = yes
+          apply_updates = {{ 'yes' if dnf_apply_updates | bool else 'no' }}
+          reboot = never
+
+          [emitters]
+          system_name = {{ ansible_fqdn | default(ansible_hostname) }}
+          emit_via = stdio
+
+          [base]
+          debuglevel = 1
+
+    - name: Crear directorios de drop-in de systemd
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /etc/systemd/system/dnf-automatic.timer.d
+        - /etc/systemd/system/dnf-automatic.service.d
+
+    - name: Crear drop-in del timer (parcheo a las {{ patch_oncalendar }})
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/dnf-automatic.timer.d/override.conf
+        mode: '0644'
+        content: |
+          [Timer]
+          OnCalendar=
+          OnCalendar={{ patch_oncalendar }}
+          RandomizedDelaySec=0
+          Persistent=true
+      register: da_timer
+
+    - name: Crear drop-in del service para disparar el reporte
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/dnf-automatic.service.d/report.conf
+        mode: '0644'
+        content: |
+          [Unit]
+          OnFailure=patch-report.service
+
+          [Service]
+          # Genera/empuja el reporte tambien cuando el parcheo termina OK.
+          ExecStartPost=-/usr/bin/systemctl start --no-block patch-report.service
+      register: da_service
+
+    - name: Recargar systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: da_timer.changed or da_service.changed
+
+    - name: Habilitar y arrancar el timer de parcheo
+      ansible.builtin.systemd:
+        name: dnf-automatic.timer
+        enabled: true
+        state: started

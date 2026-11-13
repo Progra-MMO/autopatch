@@ -1,0 +1,23 @@
+---
+# Playbook principal: configura cada servidor RedHat.
+#
+# Uso:
+#   ansible-playbook playbook.yml
+#   ansible-playbook playbook.yml -e smtp_server=10.0.0.25 -e report_mode=local
+#
+- name: Configurar parcheo automatico en servidores RedHat
+  hosts: redhat_servers
+  become: true
+  roles:
+    # En modo pull el target NO manda mail (lo hace el Servidor 1),
+    # asi que sendmail solo se instala en modo local.
+    - role: mail_relay
+      when: report_mode == 'local'
+    - role: dnf_automatic
+    - role: kpatch
+      when: kpatch_enabled | bool
+    - role: kernel_cleanup
+      when: kernel_cleanup_enabled | bool
+    # El rol corre siempre: si reboot_scheduled=false quita el timer (modo manual).
+    - role: scheduled_reboot
+    - role: patch_report

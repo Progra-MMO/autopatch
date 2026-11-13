@@ -1,0 +1,39 @@
+---
+# sendmail como relay simple hacia smtp_server (puerto 25, sin auth).
+# Nota: para relay AUTENTICADO/TLS usar mail_mta: postfix.
+
+- name: Instalar sendmail y utilidades de compilacion de config
+  ansible.builtin.package:
+    name:
+      - sendmail
+      - sendmail-cf
+      - m4
+    state: present
+
+- name: Definir SMART_HOST en sendmail.mc
+  ansible.builtin.lineinfile:
+    path: /etc/mail/sendmail.mc
+    line: "define(`SMART_HOST', `{{ smtp_server }}')dnl"
+    regexp: "^define\\(`SMART_HOST'"
+    insertbefore: '^MAILER'
+    create: false
+  notify: rebuild sendmail
+
+- name: Ajustar puerto del relay si no es 25
+  ansible.builtin.lineinfile:
+    path: /etc/mail/sendmail.mc
+    line: "define(`RELAY_MAILER_ARGS', `TCP $h {{ smtp_port }}')dnl"
+    regexp: "^define\\(`RELAY_MAILER_ARGS'"
+    insertbefore: '^MAILER'
+    create: false
+  when: smtp_port | int != 25
+  notify: rebuild sendmail
+
+- name: Habilitar y arrancar sendmail
+  ansible.builtin.service:
+    name: sendmail
+    enabled: true
+    state: started
+
+- name: Forzar reconstruccion de config si cambio
+  ansible.builtin.meta: flush_handlers

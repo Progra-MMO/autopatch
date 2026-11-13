@@ -1,0 +1,31 @@
+---
+# =====================================================================
+#  03 - KPATCH (live kernel patching)
+#  Parchea el kernel en caliente hasta el proximo reinicio.
+#  Requiere suscripcion RHEL con acceso a los paquetes kpatch-patch.
+#  Playbook INDEPENDIENTE.
+#
+#  Ejecucion:
+#    ansible-playbook -i inventario 03-kpatch.yml
+# =====================================================================
+- name: Configurar live kernel patching (kpatch)
+  hosts: "{{ target_hosts | default('redhat_servers') }}"
+  become: true
+  tasks:
+    - name: Instalar kpatch y el plugin de dnf
+      ansible.builtin.package:
+        name:
+          - kpatch
+          - kpatch-dnf
+        state: present
+
+    - name: Habilitar la instalacion automatica de parches kpatch
+      ansible.builtin.command: dnf -y kpatch auto
+      register: kpatch_auto
+      changed_when: "'Nothing to do' not in kpatch_auto.stdout"
+
+    - name: Habilitar y arrancar kpatch.service (reaplica parches al bootear)
+      ansible.builtin.systemd:
+        name: kpatch.service
+        enabled: true
+        state: started

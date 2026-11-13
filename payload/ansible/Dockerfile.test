@@ -1,0 +1,20 @@
+# Imagen para PROBAR el skill dnf-automatic-redhat con Ansible.
+# Base RedHat (UBI9) para que el entorno se parezca a los servers reales.
+FROM registry.access.redhat.com/ubi9/ubi:latest
+
+# Ansible (incluye ansible-galaxy y ansible-playbook) + systemd para probar unidades
+RUN dnf -y install python3-pip systemd openssh-clients && \
+    pip3 install --no-cache-dir ansible-core && \
+    dnf clean all
+
+# Colecciones que usa el skill
+RUN ansible-galaxy collection install community.crypto ansible.posix
+
+# Copiar el skill dentro de la imagen
+WORKDIR /skill
+COPY . /skill/
+
+# Verificacion de sintaxis al construir (falla el build si algo esta mal)
+RUN ansible-playbook --syntax-check playbook.yml
+
+CMD ["/bin/bash"]

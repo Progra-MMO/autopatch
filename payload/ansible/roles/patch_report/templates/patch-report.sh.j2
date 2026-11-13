@@ -1,0 +1,142 @@
+#!/bin/bash
+# ---------------------------------------------------------------------
+#  patch-report.sh  (generado por el skill dnf-automatic-redhat)
+#  Recolecta el estado del parcheo de ESTE servidor y, segun el modo:
+#    - local   -> envia un mail HTML directo (via sendmail)
+#    - central -> empuja un fragmento HTML al colector por scp (push)
+#    - pull    -> escribe el fragmento en un archivo local; el Servidor 1
+#                 lo recoge por SSH (no manda mail, no usa scp, no crea nada)
+#  Flag:
+#    --stdout  -> imprime el fragmento por salida estandar y termina
+#                 (lo usa el Servidor 1 para pedir el reporte por SSH)
+# ---------------------------------------------------------------------
+set -uo pipefail
+
+STDOUT_ONLY=0
+[ "${1:-}" = "--stdout" ] && STDOUT_ONLY=1
+
+CONF=/etc/patch-report.conf
+[ -f "$CONF" ] && . "$CONF"
+
+REPORT_MODE="${REPORT_MODE:-local}"
+REPORT_FILE="${REPORT_FILE:-/tmp/patch-report/latest.html}"
+HOST="$(hostname -f 2>/dev/null || hostname)"
+NOW="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+TODAY="$(date '+%Y-%m-%d')"
+
+# --- Estado global del parcheo ---------------------------------------
+if systemctl is-failed --quiet dnf-automatic.service; then
+    OVERALL="FALLO"
+else
+    OVERALL="OK"
+fi
+DA_STATE="$(systemctl show -p Result --value dnf-automatic.service 2>/dev/null || echo n/d)"
+
+# --- Datos del parcheo ----------------------------------------------
+UPDATED="$(dnf history list last 2>/dev/null | sed -n '3p' | sed 's/  */ /g')"
+LAST_PKGS="$(dnf history info last 2>/dev/null | sed -n '/Packages Altered/,$p' | head -n 80)"
+SEC_PENDING="$(dnf -q updateinfo list security --available 2>/dev/null | grep -c . || echo 0)"
+
+# --- Reinicio requerido ---------------------------------------------
+if command -v needs-restarting >/dev/null 2>&1; then
+    if needs-restarting -r >/dev/null 2>&1; then REBOOT="No"; else REBOOT="Si"; fi
+else
+    REBOOT="n/d"
+fi
+
+# --- kpatch ----------------------------------------------------------
+if command -v kpatch >/dev/null 2>&1; then
+    KPATCH="$(kpatch list 2>/dev/null | grep -v '^Loaded\|^Installed\|^$' | tr '\n' ' ')"
+    [ -z "$KPATCH" ] && KPATCH="ninguno activo"
+else
+    KPATCH="no instalado"
+fi
+
+# --- Kernels viejos removibles --------------------------------------
+OLDK="$(dnf repoquery --installonly --latest-limit=-1 -q 2>/dev/null | grep -c . || echo 0)"
+RUNK="$(uname -r)"
+
+# --- Chequeos de aplicaciones ---------------------------------------
+APP_ROWS=""
+{% for c in app_checks %}
+OUT="$({{ c.command }} 2>&1)"; RC=$?
+if [ $RC -eq 0 ]; then AST="OK"; ACL="ok"; else AST="FALLO"; ACL="fail"; OVERALL="FALLO"; fi
+APP_ROWS="${APP_ROWS}<tr><td>{{ c.name }}</td><td class=\"$ACL\">$AST</td><td><code>$(printf '%s' "$OUT" | head -c 200)</code></td></tr>"
+{% endfor %}
+
+# --- Fragmento HTML del host ----------------------------------------
+BADGE=$([ "$OVERALL" = "OK" ] && echo ok || echo fail)
+read -r -d '' FRAG <<EOF
+<section class="host">
+  <h2>${HOST} <span class="badge ${BADGE}">${OVERALL}</span></h2>
+  <table>
+    <tr><td>Fecha</td><td>${NOW}</td></tr>
+    <tr><td>Kernel en ejecucion</td><td>${RUNK}</td></tr>
+    <tr><td>Resultado dnf-automatic</td><td>${DA_STATE}</td></tr>
+    <tr><td>Ultima transaccion</td><td>${UPDATED:-sin cambios}</td></tr>
+    <tr><td>Updates de seguridad pendientes</td><td>${SEC_PENDING}</td></tr>
+    <tr><td>Requiere reinicio</td><td>${REBOOT}</td></tr>
+    <tr><td>kpatch activos</td><td>${KPATCH}</td></tr>
+    <tr><td>Kernels viejos removibles</td><td>${OLDK}</td></tr>
+  </table>
+EOF
+if [ -n "$APP_ROWS" ]; then
+    FRAG="${FRAG}<h3>Aplicaciones</h3><table><tr><th>App</th><th>Estado</th><th>Detalle</th></tr>${APP_ROWS}</table>"
+fi
+FRAG="${FRAG}<details><summary>Paquetes alterados</summary><pre>$(printf '%s' "$LAST_PKGS")</pre></details></section>"
+
+STYLE='body{font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#222}
+h1{font-size:18px}h2{font-size:15px;border-bottom:2px solid #ccc}
+table{border-collapse:collapse;margin:6px 0}td,th{border:1px solid #ddd;padding:3px 8px}
+.badge{padding:2px 8px;border-radius:4px;color:#fff;font-size:12px}
+.ok{background:#2e7d32}.fail{background:#c62828}
+td.ok{color:#2e7d32;font-weight:bold}td.fail{color:#c62828;font-weight:bold}
+code{background:#f4f4f4;padding:1px 3px}'
+
+# --- Entrega ---------------------------------------------------------
+# Si se pidio --stdout: solo imprimimos el fragmento y salimos.
+# (Lo usa el Servidor 1 para traer el reporte por SSH en modo pull.)
+if [ "$STDOUT_ONLY" -eq 1 ]; then
+    printf '%s\n' "$FRAG"
+    exit 0
+fi
+
+if [ "$REPORT_MODE" = "pull" ]; then
+    # Modo pull: dejamos el fragmento en un archivo local. El Servidor 1
+    # lo recoge por SSH. No se manda mail ni se hace scp desde aca.
+    REPORT_DIR="$(dirname "$REPORT_FILE")"
+    mkdir -p "$REPORT_DIR"
+    chmod {{ report_dir_mode | default('0755') }} "$REPORT_DIR" 2>/dev/null || true
+    printf '%s\n' "$FRAG" > "$REPORT_FILE"
+    chmod {{ report_file_mode | default('0644') }} "$REPORT_FILE" 2>/dev/null || true
+{% if report_owner | default('') %}
+    # Dueno del archivo para que el Servidor 1 (xtk) pueda descargarlo.
+    chown {{ report_owner }}{% if report_group | default('') %}:{{ report_group }}{% endif %} "$REPORT_DIR" "$REPORT_FILE" 2>/dev/null || true
+{% endif %}
+    logger -t patch-report "Reporte de ${HOST} escrito en ${REPORT_FILE} (${OVERALL})"
+elif [ "$REPORT_MODE" = "central" ]; then
+    TMP="$(mktemp)"
+    printf '%s\n' "$FRAG" > "$TMP"
+    if scp -q -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+            -i "${COLLECTOR_SSH_KEY}" \
+            "$TMP" "${COLLECTOR_USER}@${COLLECTOR_HOST}:${COLLECTOR_SPOOL}/${HOST}__${TODAY}.html"; then
+        logger -t patch-report "Reporte de ${HOST} enviado al colector (${OVERALL})"
+    else
+        logger -t patch-report "ERROR: no se pudo enviar el reporte al colector"
+    fi
+    rm -f "$TMP"
+else
+    {
+        echo "To: ${REPORT_TO}"
+        echo "From: ${MAIL_FROM}"
+        echo "Subject: [Parcheo ${OVERALL}] ${HOST} ${TODAY}"
+        echo "MIME-Version: 1.0"
+        echo "Content-Type: text/html; charset=UTF-8"
+        echo
+        echo "<html><head><meta charset=\"utf-8\"><style>${STYLE}</style></head><body>"
+        echo "<h1>Checklist de parcheo &mdash; ${HOST}</h1>"
+        printf '%s\n' "$FRAG"
+        echo "</body></html>"
+    } | /usr/sbin/sendmail -t -i
+    logger -t patch-report "Reporte de ${HOST} enviado por mail a ${REPORT_TO} (${OVERALL})"
+fi

@@ -1,0 +1,27 @@
+---
+# Rol que corre en el Servidor 1: recoge los reportes por SSH (pull),
+# los concatena y envia UN solo mail. No crea usuarios en ningun lado.
+
+# Usuario y clave SSH que YA existen en el Servidor 1 para entrar a los targets.
+puller_ssh_user: root
+puller_ssh_key: /root/.ssh/id_rsa
+
+# Lista de hosts a recoger. Si se deja vacia, se usa el grupo
+# [redhat_servers] del inventario.
+puller_hosts: []
+
+# Como obtener el reporte de cada host:
+#   file     -> lee el archivo que el target dejo (cat REMOTE_FILE)  [default]
+#   generate -> ejecuta patch-report.sh --stdout en el target (estado al momento)
+puller_method: file
+puller_remote_file: /tmp/patch-report/latest.html
+
+# Donde deja el Servidor 1 los fragmentos recogidos y el archivo.
+puller_spool: /tmp/patch-reports/incoming
+puller_archive: /tmp/patch-reports/archive
+
+# Hora del checklist consolidado (margen despues del parcheo de las 23:00).
+puller_oncalendar: "*-*-* 23:40:00"
+
+report_to: "infraestructura@empresa.com"
+mail_from: "parcheo@{{ ansible_fqdn | default(ansible_hostname) }}"

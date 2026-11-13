@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+# =====================================================================
+#  autopatch  -  wrapper de instalacion de parcheo + alta en PULLER_HOSTS
+# ---------------------------------------------------------------------
+#  Uso:
+#    autopatch SERVIDOR <dia_ini> a <dia_fin> <DiaSemana> <HH:MM> <TICKET>
+#    autopatch SERVIDOR <rango> <DiaSemana> <HH:MM> <TICKET>
+#    autopatch SERVIDOR manual <TICKET>        (parchea SIN reinicio automatico)
+#
+#  Ejemplos:
+#    autopatch SRVWEB01 1 a 7 Sab 0:00 GCAM-12501
+#    autopatch SRVWEB01 1..7 Sab 0:00 GCAM-12501
+#    autopatch SRVWEB01 22..28 Vie 17:00 GCAM-13000
+#    autopatch SRVWEB01 manual GCAM-12501      -> reinicio a mano, sin timer
+#
+#  Que hace:
+#    1) Traduce "<dia_ini> a <dia_fin> <DiaSemana> <HH:MM>" a un
+#       reboot_oncalendar systemd:  "Sat *-*-1..7 0:00:00"
+#    2) Ejecuta:
+#         ansible-playbook <PLAYBOOK> --limit SERVIDOR \
+#            -e report_mode=pull -e report_owner=<OWNER> \
+#            -e reboot_oncalendar="..."
+#    3) Si el playbook termina OK (exit 0), agrega SERVIDOR al final del
+#       archivo PULLER_HOSTS, debajo del comentario "#TICKET".
+#       - Si el comentario no existe, lo crea.
+#       - Si existe, agrega el servidor en la linea de abajo.
+#       - Si el servidor ya figura, no lo duplica.
+#
+#  Variables de entorno (opcionales, con sus defaults):
+#    AUTOPATCH_PLAYBOOK   /etc/ansible/playbooks/10-install-autopatch.yml
+#    AUTOPATCH_HOSTSFILE  /opt/autopatch/PULLER_HOSTS
+#    AUTOPATCH_OWNER      usuario-servicio
+#    AUTOPATCH_DRYRUN     1 = solo muestra lo que haria, no ejecuta nada
+# =====================================================================
+set -euo pipefail
+
+# --- correr siempre como usuario-servicio ----------------------------
+# Si lo invoca otro usuario (p.ej. usuario1), el script se re-lanza a si
+# mismo como usuario-servicio. Asi el playbook usa la clave SSH de ese
+# usuario y el alta en PULLER_HOSTS se hace con el owner correcto.
+# -H ajusta HOME -> el temp de Ansible queda en /home/.../usuario-servicio
+RUN_AS="${AUTOPATCH_RUNAS:-usuario-servicio}"
+if [ "$(id -un)" != "$RUN_AS" ]; then
+  exec sudo -u "$RUN_AS" -H "$0" "$@"
+fi
+
+PLAYBOOK="${AUTOPATCH_PLAYBOOK:-/etc/ansible/playbooks/10-install-autopatch.yml}"
+HOSTSFILE="${AUTOPATCH_HOSTSFILE:-/opt/autopatch/PULLER_HOSTS}"
+OWNER="${AUTOPATCH_OWNER:-usuario-servicio}"
+DRYRUN="${AUTOPATCH_DRYRUN:-0}"
+
+# --- directorios temporales de Ansible por-usuario ---------------------
+# Evita el "Permission denied: /tmp/.ansible/tmp" cuando el dir /tmp/.ansible
+# quedo de otro usuario (p.ej. root). Cada usuario usa su propio $HOME.
+export ANSIBLE_LOCAL_TEMP="${ANSIBLE_LOCAL_TEMP:-$HOME/.ansible/tmp}"
+export ANSIBLE_SSH_CONTROL_PATH_DIR="${ANSIBLE_SSH_CONTROL_PATH_DIR:-$HOME/.ansible/cp}"
+mkdir -p "$ANSIBLE_LOCAL_TEMP" "$ANSIBLE_SSH_CONTROL_PATH_DIR" 2>/dev/null || true
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+usage() {
+  sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'
+  exit 1
+}
+
+[ $# -ge 1 ] || usage
+case "$1" in -h|--help|help) usage;; esac
+
+# --- dia de semana ES -> systemd (EN) ----------------------------------
+wd_to_systemd() {
+  # minusculas + quitar acentos
+  local w
+  w=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' \
+        | sed 'y/áéíóúñ/aeioun/')
+  case "$w" in
+    lun|lunes)                 echo "Mon";;
+    mar|martes)                echo "Tue";;
+    mie|mier|miercoles)        echo "Wed";;
+    jue|jueves)                echo "Thu";;
+    vie|viernes)               echo "Fri";;
+    sab|sabado)                echo "Sat";;
+    dom|domingo)               echo "Sun";;
+    mon|tue|wed|thu|fri|sat|sun)
+        # ya viene en ingles -> capitalizar
+        echo "$(tr '[:lower:]' '[:upper:]' <<<"${w:0:1}")${w:1}";;
+    *) die "Dia de semana no reconocido: '$1' (use Lun/Mar/Mie/Jue/Vie/Sab/Dom)";;
+  esac
+}
+
+# --- parseo de argumentos ----------------------------------------------
+SERVER="$1"; shift
+
+# --- modo de reinicio ---------------------------------------------------
+# Manual (sin timer):  autopatch SERVIDOR manual <TICKET>
+# Automatico (timer):  autopatch SERVIDOR <rango> <DiaSemana> <HH:MM> <TICKET>
+case "${1:-}" in
+  manual|MANUAL|sinreboot|noreboot|no)
+    REBOOT_MODE="manual"
+    shift
+    TICKET="${1:-}"
+    [ -n "$TICKET" ] || die "Falta el ticket (ej: autopatch $SERVER manual GCAM-12501)"
+    REBOOT_DESC="MANUAL (sin timer, reinicio a mano)"
+    REBOOT_JSON='"reboot_scheduled":false'
+    ;;
+  *)
+    REBOOT_MODE="auto"
+    # el rango puede venir como "1 a 7" (3 tokens) o "1..7" / "1-7" (1 token)
+    if [ "${2:-}" = "a" ] || [ "${2:-}" = "A" ]; then
+      RANGE="${1}..${3}"
+      shift 3
+    else
+      RANGE="$1"
+      shift 1
+    fi
+    # normalizar separador: 1-7 -> 1..7 ; dejar 1..7 y numero suelto como estan
+    RANGE="${RANGE//../..}"
+    RANGE="${RANGE//-/..}"
+
+    WD_RAW="${1:-}"; TIME_RAW="${2:-}"; TICKET="${3:-}"
+    [ -n "$WD_RAW" ]   || die "Falta el dia de semana (ej: Sab)"
+    [ -n "$TIME_RAW" ] || die "Falta la hora (ej: 0:00)"
+    [ -n "$TICKET" ]   || die "Falta el ticket (ej: GCAM-12501)"
+
+    WD="$(wd_to_systemd "$WD_RAW")"
+
+    # hora -> HH:MM:SS
+    case "$TIME_RAW" in
+      *:*:*) TIME="$TIME_RAW";;
+      *:*)   TIME="${TIME_RAW}:00";;
+      *)     die "Hora invalida: '$TIME_RAW' (use HH:MM, ej 0:00)";;
+    esac
+
+    REBOOT_OC="${WD} *-*-${RANGE} ${TIME}"
+
+    # --- validar la expresion calendar si tenemos systemd-analyze ------
+    if command -v systemd-analyze >/dev/null 2>&1; then
+      systemd-analyze calendar "$REBOOT_OC" >/dev/null 2>&1 \
+        || die "reboot_oncalendar invalido: '$REBOOT_OC'"
+    fi
+    REBOOT_DESC="$REBOOT_OC"
+    REBOOT_JSON='"reboot_oncalendar":"'"${REBOOT_OC}"'"'
+    ;;
+esac
+
+echo "=========================================================="
+echo " Servidor         : $SERVER"
+echo " Ticket           : $TICKET"
+echo " reinicio         : $REBOOT_DESC"
+echo " Playbook         : $PLAYBOOK"
+echo " PULLER_HOSTS     : $HOSTSFILE"
+echo "=========================================================="
+
+# extra-vars en JSON: ansible corta el formato "key=value" en el primer
+# espacio, por eso un reboot_oncalendar con espacios (p.ej. "Thu *-*-22..28
+# 00:00:00") quedaba truncado a "Thu". En JSON se preservan los espacios.
+EXTRA_JSON='{"report_mode":"pull","report_owner":"'"${OWNER}"'",'"${REBOOT_JSON}"'}'
+
+CMD=( ansible-playbook "$PLAYBOOK" --limit "$SERVER"
+      -e "$EXTRA_JSON" )
+
+echo "+ ${CMD[*]}"
+
+if [ "$DRYRUN" = "1" ]; then
+  echo "[DRY-RUN] no se ejecuta el playbook ni se toca $HOSTSFILE"
+  exit 0
+fi
+
+# --- ejecutar el playbook ----------------------------------------------
+if ! "${CMD[@]}"; then
+  die "El playbook fallo. NO se agrega $SERVER a $HOSTSFILE."
+fi
+
+echo
+echo ">> Playbook OK. Registrando $SERVER en $HOSTSFILE ..."
+
+# --- alta en PULLER_HOSTS ----------------------------------------------
+register_host() {
+  local file="$1" ticket="$2" server="$3"
+  local tag="#${ticket}"
+
+  # Si el archivo (o su directorio) no es escribible por este usuario,
+  # usamos sudo para todas las escrituras.
+  local SUDO=""
+  local dir; dir="$(dirname "$file")"
+  if { [ -e "$file" ] && [ ! -w "$file" ]; } || \
+     { [ ! -e "$file" ] && [ ! -w "$dir" ]; }; then
+    SUDO="sudo"
+  fi
+
+  # crear archivo/directorio si no existen
+  if [ ! -f "$file" ]; then
+    $SUDO mkdir -p "$dir"
+    $SUDO touch "$file"
+  fi
+
+  # ya figura en cualquier grupo?  (linea de host, ignora comentarios)
+  if awk -v s="$server" '!/^[[:space:]]*#/ && $1==s {f=1} END{exit !f}' "$file"; then
+    echo "  [=] $server ya figura en $file (no se duplica)"
+    return 0
+  fi
+
+  if grep -qE "^#[[:space:]]*${ticket}([[:space:]]|$)" "$file"; then
+    # comentario existe -> insertar servidor justo debajo del comentario
+    awk -v t="$ticket" -v s="$server" '
+      { print }
+      !done && $0 ~ "^#[[:space:]]*" t "([[:space:]]|$)" { print s; done=1 }
+    ' "$file" | $SUDO tee "${file}.tmp" >/dev/null && $SUDO mv "${file}.tmp" "$file"
+    echo "  [+] $server agregado bajo $tag"
+  else
+    # comentario no existe -> crearlo al final con el servidor debajo
+    local nl=""
+    if [ -s "$file" ] && [ -n "$(tail -c1 "$file" 2>/dev/null)" ]; then
+      nl=$'\n'
+    fi
+    printf '%s%s\n%s\n' "$nl" "$tag" "$server" | $SUDO tee -a "$file" >/dev/null
+    echo "  [+] creado $tag con $server"
+  fi
+}
+
+register_host "$HOSTSFILE" "$TICKET" "$SERVER"
+
+echo
+echo "Listo. Estado actual de $HOSTSFILE:"
+echo "----------------------------------------------------------"
+cat "$HOSTSFILE"
+echo "----------------------------------------------------------"
