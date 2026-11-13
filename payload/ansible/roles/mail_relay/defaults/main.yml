@@ -1,0 +1,7 @@
+---
+mail_mta: sendmail
+smtp_server: "smtp.empresa.com"
+smtp_port: 25
+smtp_use_tls: false
+smtp_username: ""
+smtp_password: ""

@@ -1,0 +1,80 @@
+---
+- name: Instalar dependencias del puller
+  ansible.builtin.package:
+    name:
+      - openssh-clients   # provee ssh
+      - python3
+    state: present
+
+- name: Crear directorios de spool y archivo
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  loop:
+    - "{{ puller_spool }}"
+    - "{{ puller_archive }}"
+
+- name: Instalar configuracion del puller
+  ansible.builtin.template:
+    src: patch-puller.conf.j2
+    dest: /etc/patch-puller.conf
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Instalar collect-reports.sh
+  ansible.builtin.template:
+    src: collect-reports.sh.j2
+    dest: /usr/local/sbin/collect-reports.sh
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Instalar build-report.py
+  ansible.builtin.template:
+    src: build-report.py.j2
+    dest: /usr/local/sbin/build-report.py
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Instalar servicio de consolidacion (pull)
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/patch-consolidate.service
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=Recoge reportes por SSH, consolida y envia checklist unico
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/collect-reports.sh
+  notify: reload systemd
+
+- name: Instalar timer de consolidacion ({{ puller_oncalendar }})
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/patch-consolidate.timer
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=Timer de consolidacion de reportes de parcheo (pull)
+
+      [Timer]
+      OnCalendar={{ puller_oncalendar }}
+      Persistent=true
+
+      [Install]
+      WantedBy=timers.target
+  notify: reload systemd
+
+- name: Recargar systemd
+  ansible.builtin.meta: flush_handlers
+
+- name: Habilitar y arrancar el timer de consolidacion
+  ansible.builtin.systemd:
+    name: patch-consolidate.timer
+    enabled: true
+    state: started

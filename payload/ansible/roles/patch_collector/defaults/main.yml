@@ -1,0 +1,9 @@
+---
+collector_user: "patchrpt"
+collector_spool: "/var/spool/patch-reports/incoming"
+collector_archive: "/var/spool/patch-reports/archive"
+collector_oncalendar: "*-*-* 23:40:00"
+report_to: "infraestructura@empresa.com"
+mail_from: "parcheo@{{ ansible_fqdn | default(ansible_hostname) }}"
+# Lista de claves publicas de los servidores autorizados a empujar reportes.
+collector_authorized_keys: []

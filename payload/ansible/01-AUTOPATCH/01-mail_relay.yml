@@ -1,0 +1,127 @@
+---
+# =====================================================================
+#  01 - MAIL RELAY (smarthost)
+#  Configura el MTA local (sendmail por defecto, o postfix) para que
+#  reenvie todo el correo al SMTP corporativo (variable smtp_server).
+#  Playbook INDEPENDIENTE: no depende del arbol roles/.
+#
+#  Ejecucion:
+#    ansible-playbook -i inventario 01-mail_relay.yml -e smtp_server=smtp.tucliente.com
+#
+#  Variables:
+#    smtp_server   (OBLIGATORIA) host del SMTP corporativo
+#    smtp_port     puerto (default 25)
+#    mail_mta      sendmail | postfix   (default sendmail)
+#    smtp_username / smtp_password  (solo postfix con SASL)
+#    smtp_use_tls  true/false (solo postfix)
+# =====================================================================
+- name: Configurar MTA local como smarthost
+  hosts: "{{ target_hosts | default('redhat_servers') }}"
+  become: true
+  vars:
+    smtp_port: 25
+    mail_mta: sendmail
+    smtp_use_tls: false
+    smtp_username: ""
+    smtp_password: ""
+  tasks:
+    - name: Validar que smtp_server este definido
+      ansible.builtin.assert:
+        that:
+          - smtp_server is defined
+          - smtp_server | length > 0
+        fail_msg: "Debes definir smtp_server, ej: -e smtp_server=smtp.tucliente.com"
+
+    # ---------------- sendmail ----------------
+    - name: Bloque sendmail
+      when: mail_mta == 'sendmail'
+      block:
+        - name: Instalar sendmail y utilidades de compilacion
+          ansible.builtin.package:
+            name:
+              - sendmail
+              - sendmail-cf
+              - m4
+            state: present
+
+        - name: Definir SMART_HOST en sendmail.mc
+          ansible.builtin.lineinfile:
+            path: /etc/mail/sendmail.mc
+            line: "define(`SMART_HOST', `{{ smtp_server }}')dnl"
+            regexp: "^define\\(`SMART_HOST'"
+            insertbefore: '^MAILER'
+            create: false
+          register: sm_smarthost
+
+        - name: Ajustar puerto del relay si no es 25
+          ansible.builtin.lineinfile:
+            path: /etc/mail/sendmail.mc
+            line: "define(`RELAY_MAILER_ARGS', `TCP $h {{ smtp_port }}')dnl"
+            regexp: "^define\\(`RELAY_MAILER_ARGS'"
+            insertbefore: '^MAILER'
+            create: false
+          when: smtp_port | int != 25
+          register: sm_port
+
+        - name: Reconstruir configuracion de sendmail
+          ansible.builtin.command: make -C /etc/mail
+          when: sm_smarthost.changed or sm_port.changed
+          changed_when: true
+
+        - name: Habilitar y (re)arrancar sendmail
+          ansible.builtin.service:
+            name: sendmail
+            enabled: true
+            state: "{{ 'restarted' if (sm_smarthost.changed or sm_port.changed) else 'started' }}"
+
+    # ---------------- postfix ----------------
+    - name: Bloque postfix
+      when: mail_mta == 'postfix'
+      block:
+        - name: Instalar postfix y libs SASL
+          ansible.builtin.package:
+            name:
+              - postfix
+              - cyrus-sasl-plain
+            state: present
+
+        - name: Configurar relayhost y modo null-client
+          ansible.builtin.command: >
+            postconf -e
+            "relayhost=[{{ smtp_server }}]:{{ smtp_port }}"
+            "inet_interfaces=loopback-only"
+            "mydestination="
+          changed_when: true
+
+        - name: Configurar autenticacion SASL (si hay usuario)
+          when: smtp_username | length > 0
+          block:
+            - name: Crear mapa sasl_passwd
+              ansible.builtin.copy:
+                dest: /etc/postfix/sasl_passwd
+                mode: '0600'
+                content: "[{{ smtp_server }}]:{{ smtp_port }} {{ smtp_username }}:{{ smtp_password }}\n"
+              no_log: true
+
+            - name: Compilar mapa sasl_passwd
+              ansible.builtin.command: postmap /etc/postfix/sasl_passwd
+              changed_when: true
+
+            - name: Activar SASL en postfix
+              ansible.builtin.command: >
+                postconf -e
+                "smtp_sasl_auth_enable=yes"
+                "smtp_sasl_password_maps=hash:/etc/postfix/sasl_passwd"
+                "smtp_sasl_security_options=noanonymous"
+              changed_when: true
+
+        - name: Activar TLS de salida (si corresponde)
+          ansible.builtin.command: >
+            postconf -e "smtp_tls_security_level={{ 'encrypt' if smtp_use_tls | bool else 'may' }}"
+          changed_when: true
+
+        - name: Habilitar y reiniciar postfix
+          ansible.builtin.service:
+            name: postfix
+            enabled: true
+            state: restarted

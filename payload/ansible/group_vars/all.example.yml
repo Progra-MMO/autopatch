@@ -1,0 +1,80 @@
+---
+# =====================================================================
+#  Copiá este archivo a group_vars/all.yml y ajustá los valores.
+#  Las contraseñas ponelas con ansible-vault (ver SKILL.md).
+# =====================================================================
+
+# --------------------------- CORREO / SMTP ---------------------------
+# MTA a configurar como smarthost (se instala donde se manda el mail:
+# en los targets si report_mode=local, o en el Servidor 1 si pull/central).
+#   sendmail -> pedido del requerimiento (relay simple, puerto 25, sin auth)
+#   postfix  -> recomendado si tu SMTP corporativo exige AUTH y/o TLS
+mail_mta: sendmail
+
+# Servidor SMTP corporativo (ESTA es la variable que se pasa al playbook).
+smtp_server: "smtp.empresa.com"
+smtp_port: 25
+
+# Solo para mail_mta=postfix con relay autenticado (opcional).
+smtp_use_tls: false
+smtp_username: ""
+smtp_password: ""          # <-- usar ansible-vault
+
+# Remitente y destinatario final del checklist.
+mail_from: "parcheo@{{ ansible_fqdn | default(ansible_hostname) }}"
+report_to: "infraestructura@empresa.com"
+
+# ----------------------- MODO DE REPORTE -----------------------------
+#   pull    -> RECOMENDADO para tu caso. El Servidor 1 entra por SSH a
+#              cada server (con la clave que YA tiene), trae el reporte,
+#              lo concatena y manda UN solo mail. No crea usuarios.
+#   local   -> cada servidor manda su propio mail (1 mail por server).
+#   central -> cada servidor EMPUJA su reporte por scp a un colector (push).
+report_mode: pull
+
+# ------- Modo pull: el target solo deja su reporte en un archivo -------
+# (lo lee el Servidor 1). Ruta local en cada server:
+report_file: "/tmp/patch-report/latest.html"
+
+# ------- Modo pull: parametros del Servidor 1 (grupo [puller]) --------
+puller_ssh_user: root                       # login SSH existente en el Srv1
+puller_ssh_key: /root/.ssh/id_rsa           # clave que YA usa el Srv1
+puller_method: file                         # file (lee el archivo) | generate
+puller_remote_file: "/tmp/patch-report/latest.html"
+puller_spool: /tmp/patch-reports/incoming
+puller_archive: /tmp/patch-reports/archive
+puller_oncalendar: "*-*-* 23:40:00"
+# puller_hosts: []   # vacio = usa el grupo [redhat_servers] del inventario
+
+# ------- Modo central (push) - solo si usaras report_mode=central -----
+collector_host: "servidor1"
+collector_user: "patchrpt"
+collector_spool: "/var/spool/patch-reports/incoming"
+collector_archive: "/var/spool/patch-reports/archive"
+collector_ssh_key: "/root/.ssh/id_patchreport"
+collector_oncalendar: "*-*-* 23:40:00"
+
+# ------------------------ dnf-automatic ------------------------------
+dnf_upgrade_type: default        # default (todo) | security (solo seguridad)
+dnf_apply_updates: true          # true = aplica; false = solo descarga
+patch_oncalendar: "*-*-* 23:00:00"
+
+# ---------------------------- kpatch ---------------------------------
+kpatch_enabled: true
+
+# ------------------ limpieza de kernels viejos -----------------------
+kernel_cleanup_enabled: true
+
+# ---------------------- reinicio programado --------------------------
+reboot_scheduled: true
+reboot_oncalendar: "Sat *-*-* 15:00:00"
+
+# ----------------- chequeos de aplicaciones (opc.) -------------------
+# Cada item se ejecuta en el server y se agrega al checklist.
+# RC=0 -> OK ; RC!=0 -> FALLO.
+app_checks: []
+# app_checks:
+#   - name: nginx
+#     command: systemctl is-active nginx
+#   - name: postgresql
+#     command: systemctl is-active postgresql

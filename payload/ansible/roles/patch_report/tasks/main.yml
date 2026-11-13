@@ -1,0 +1,40 @@
+---
+- name: Instalar dependencias del reporte
+  ansible.builtin.package:
+    name:
+      - yum-utils        # provee needs-restarting
+      - openssh-clients  # provee scp (modo central)
+    state: present
+
+- name: Instalar archivo de configuracion del reporte
+  ansible.builtin.template:
+    src: patch-report.conf.j2
+    dest: /etc/patch-report.conf
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Instalar script patch-report.sh
+  ansible.builtin.template:
+    src: patch-report.sh.j2
+    dest: /usr/local/sbin/patch-report.sh
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Instalar unidad patch-report.service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/patch-report.service
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=Genera y envia/empuja el reporte de parcheo
+      After=dnf-automatic.service network-online.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/patch-report.sh
+  notify: reload systemd
+
+- name: Recargar systemd
+  ansible.builtin.meta: flush_handlers

@@ -1,0 +1,29 @@
+---
+# Servicio one-shot que se ejecuta despues de CADA reinicio y borra
+# los kernels viejos (los que quedaron obsoletos tras un parcheo previo).
+
+- name: Instalar unidad remove-old-kernels.service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/remove-old-kernels.service
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=Eliminar kernels viejos tras el arranque
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/bin/dnf remove -y --oldinstallonly
+
+      [Install]
+      WantedBy=multi-user.target
+  notify: reload systemd
+
+- name: Recargar systemd
+  ansible.builtin.meta: flush_handlers
+
+- name: Habilitar remove-old-kernels.service (corre en cada boot)
+  ansible.builtin.systemd:
+    name: remove-old-kernels.service
+    enabled: true

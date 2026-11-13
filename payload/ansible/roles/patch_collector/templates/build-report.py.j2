@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+# ---------------------------------------------------------------------
+#  build-report.py  (skill dnf-automatic-redhat)
+#  Toma todos los fragmentos HTML que dejaron los servidores en el spool,
+#  arma UN solo checklist HTML y envia UN unico mail. Luego archiva.
+# ---------------------------------------------------------------------
+import os, glob, datetime, subprocess
+
+SPOOL   = "{{ collector_spool }}"
+ARCHIVE = "{{ collector_archive }}"
+REPORT_TO = "{{ report_to }}"
+MAIL_FROM = "{{ mail_from }}"
+
+today = datetime.date.today().isoformat()
+now   = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+files = sorted(glob.glob(os.path.join(SPOOL, "*.html")))
+
+STYLE = """body{font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#222}
+h1{font-size:20px}h2{font-size:15px;border-bottom:2px solid #ccc}
+table{border-collapse:collapse;margin:6px 0}td,th{border:1px solid #ddd;padding:3px 8px}
+.badge{padding:2px 8px;border-radius:4px;color:#fff;font-size:12px}
+.ok{background:#2e7d32}.fail{background:#c62828}
+td.ok{color:#2e7d32;font-weight:bold}td.fail{color:#c62828;font-weight:bold}
+.summary td{font-weight:bold}code{background:#f4f4f4;padding:1px 3px}"""
+
+rows, sections, n_ok, n_fail = [], [], 0, 0
+for f in files:
+    frag = open(f, encoding="utf-8", errors="replace").read()
+    host = os.path.basename(f).split("__")[0]
+    status = "FALLO" if 'badge fail' in frag else "OK"
+    cls = "fail" if status == "FALLO" else "ok"
+    if status == "OK":
+        n_ok += 1
+    else:
+        n_fail += 1
+    rows.append(f'<tr><td>{host}</td><td class="{cls}">{status}</td></tr>')
+    sections.append(frag)
+
+total = len(files)
+header = (
+    f"<h1>Checklist diario de parcheo &mdash; {today}</h1>"
+    f"<p>Generado {now} &middot; {total} servidores "
+    f"(<span class='ok'>&nbsp;{n_ok} OK&nbsp;</span> "
+    f"<span class='fail'>&nbsp;{n_fail} con fallas&nbsp;</span>)</p>"
+    "<h2>Resumen</h2>"
+    "<table class='summary'><tr><th>Servidor</th><th>Estado</th></tr>"
+    + "".join(rows) + "</table>"
+)
+if total == 0:
+    header += "<p><b>No se recibio ningun reporte hoy.</b> Revisar conectividad/scp de los servidores.</p>"
+
+body = (
+    f"<html><head><meta charset='utf-8'><style>{STYLE}</style></head><body>"
+    + header + "<h2>Detalle por servidor</h2>" + "".join(sections)
+    + "</body></html>"
+)
+
+subject = f"[Parcheo diario] {today} - {n_ok} OK / {n_fail} fallas ({total} servers)"
+msg = (
+    f"To: {REPORT_TO}\n"
+    f"From: {MAIL_FROM}\n"
+    f"Subject: {subject}\n"
+    "MIME-Version: 1.0\n"
+    "Content-Type: text/html; charset=UTF-8\n\n"
+    + body
+)
+
+p = subprocess.run(["/usr/sbin/sendmail", "-t", "-i"],
+                   input=msg.encode("utf-8"))
+
+# Archivar los fragmentos procesados
+if files:
+    dest = os.path.join(ARCHIVE, today)
+    os.makedirs(dest, exist_ok=True)
+    for f in files:
+        os.rename(f, os.path.join(dest, os.path.basename(f)))
+
+print(f"Checklist enviado a {REPORT_TO}: {total} servers, {n_fail} fallas.")

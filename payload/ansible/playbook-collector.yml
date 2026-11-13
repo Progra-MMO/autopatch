@@ -1,0 +1,14 @@
+---
+# Playbook del COLECTOR (solo modo report_mode=central).
+# Configura el host que recibe los reportes de todos los servers,
+# los concatena en un unico HTML y envia UN solo mail diario.
+#
+# Uso:
+#   ansible-playbook playbook-collector.yml
+#
+- name: Configurar colector de reportes de parcheo
+  hosts: collector
+  become: true
+  roles:
+    - role: mail_relay        # el colector tambien necesita salida SMTP
+    - role: patch_collector

@@ -1,0 +1,82 @@
+---
+# =====================================================================
+#  05 - SCHEDULED REBOOT (reinicio programado)
+#  Reinicia el sistema segun un timer de systemd (por defecto sabados
+#  a las 15:00). Playbook INDEPENDIENTE.
+#
+#  Ejecucion:
+#    ansible-playbook -i inventario 05-scheduled_reboot.yml
+#
+#  Variables:
+#    reboot_oncalendar   default "Sat *-*-* 15:00:00"
+# =====================================================================
+- name: Configurar reinicio programado
+  hosts: "{{ target_hosts | default('redhat_servers') }}"
+  become: true
+  vars:
+    reboot_oncalendar: "Sat *-*-* 15:00:00"
+    reboot_scheduled: true          # false = reinicio MANUAL (no instala/cancela el timer)
+  tasks:
+    # ---- MODO AUTOMATICO: instalar y habilitar el timer -----------------
+    - name: Instalar servicio de reinicio programado
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/scheduled-reboot.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Reinicio programado del sistema
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/bin/systemctl reboot
+      register: sr_service
+      when: reboot_scheduled | bool
+
+    - name: Instalar timer de reinicio programado ({{ reboot_oncalendar }})
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/scheduled-reboot.timer
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Timer de reinicio programado
+
+          [Timer]
+          OnCalendar={{ reboot_oncalendar }}
+          Persistent=false
+
+          [Install]
+          WantedBy=timers.target
+      register: sr_timer
+      when: reboot_scheduled | bool
+
+    - name: Habilitar y arrancar el timer de reinicio
+      ansible.builtin.systemd:
+        name: scheduled-reboot.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+      when: reboot_scheduled | bool
+
+    # ---- MODO MANUAL: cancelar y quitar el timer si existiera -----------
+    - name: Detener y deshabilitar el timer de reinicio (modo manual)
+      ansible.builtin.systemd:
+        name: scheduled-reboot.timer
+        enabled: false
+        state: stopped
+      failed_when: false
+      when: not (reboot_scheduled | bool)
+
+    - name: Quitar las units de reinicio programado (modo manual)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/systemd/system/scheduled-reboot.timer
+        - /etc/systemd/system/scheduled-reboot.service
+      register: sr_removed
+      when: not (reboot_scheduled | bool)
+
+    - name: Recargar systemd (modo manual)
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: not (reboot_scheduled | bool) and sr_removed is changed

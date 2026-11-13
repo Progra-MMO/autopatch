@@ -1,0 +1,41 @@
+---
+# =====================================================================
+#  04 - KERNEL CLEANUP (limpieza de kernels viejos)
+#  Servicio one-shot que corre despues de CADA reinicio y elimina los
+#  kernels obsoletos que quedaron tras un parcheo previo.
+#  Playbook INDEPENDIENTE.
+#
+#  Ejecucion:
+#    ansible-playbook -i inventario 04-kernel_cleanup.yml
+# =====================================================================
+- name: Configurar limpieza de kernels viejos post-reinicio
+  hosts: "{{ target_hosts | default('redhat_servers') }}"
+  become: true
+  tasks:
+    - name: Instalar unidad remove-old-kernels.service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/remove-old-kernels.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Eliminar kernels viejos tras el arranque
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/bin/dnf remove -y --oldinstallonly
+
+          [Install]
+          WantedBy=multi-user.target
+      register: rk_unit
+
+    - name: Recargar systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: rk_unit.changed
+
+    - name: Habilitar remove-old-kernels.service (corre en cada boot)
+      ansible.builtin.systemd:
+        name: remove-old-kernels.service
+        enabled: true

@@ -1,0 +1,7 @@
+# Gestionado por Ansible (skill dnf-automatic-redhat) - rol patch_puller
+PULLER_SSH_USER={{ puller_ssh_user }}
+PULLER_SSH_KEY={{ puller_ssh_key }}
+PULLER_METHOD={{ puller_method }}
+PULLER_REMOTE_FILE={{ puller_remote_file }}
+PULLER_SPOOL={{ puller_spool }}
+PULLER_HOSTS={{ (puller_hosts | join(',')) if (puller_hosts | length > 0) else (groups['redhat_servers'] | default([]) | join(',')) }}

@@ -1,0 +1,9 @@
+---
+- name: rebuild sendmail
+  ansible.builtin.command: make -C /etc/mail
+  notify: restart sendmail
+
+- name: restart sendmail
+  ansible.builtin.service:
+    name: sendmail
+    state: restarted

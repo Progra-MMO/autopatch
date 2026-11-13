@@ -1,0 +1,47 @@
+#!/bin/bash
+# ---------------------------------------------------------------------
+#  collect-reports.sh  (skill dnf-automatic-redhat - Servidor 1)
+#  Entra por SSH a cada servidor con la clave existente, trae su
+#  fragmento de reporte al spool y luego dispara la consolidacion + mail.
+#  No crea usuarios: usa el login SSH que ya tiene el Servidor 1.
+# ---------------------------------------------------------------------
+set -uo pipefail
+
+CONF=/etc/patch-puller.conf
+[ -f "$CONF" ] && . "$CONF"
+
+SPOOL="${PULLER_SPOOL:-/tmp/patch-reports/incoming}"
+SSH_USER="${PULLER_SSH_USER:-root}"
+SSH_KEY="${PULLER_SSH_KEY:-/root/.ssh/id_rsa}"
+METHOD="${PULLER_METHOD:-file}"
+REMOTE_FILE="${PULLER_REMOTE_FILE:-/tmp/patch-report/latest.html}"
+TODAY="$(date +%F)"
+
+mkdir -p "$SPOOL"
+rm -f "$SPOOL"/*.html 2>/dev/null
+
+if [ "$METHOD" = "generate" ]; then
+    REMOTE_CMD="/usr/local/sbin/patch-report.sh --stdout"
+else
+    REMOTE_CMD="cat ${REMOTE_FILE}"
+fi
+
+IFS=',' read -ra HOSTS <<< "${PULLER_HOSTS:-}"
+for raw in "${HOSTS[@]}"; do
+    h="$(echo "$raw" | xargs)"
+    [ -z "$h" ] && continue
+    OUT="$SPOOL/${h}__${TODAY}.html"
+    if ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=15 \
+           -o StrictHostKeyChecking=accept-new \
+           "${SSH_USER}@${h}" "$REMOTE_CMD" > "$OUT" 2>/dev/null && [ -s "$OUT" ]; then
+        logger -t patch-puller "Reporte de ${h} recogido OK"
+    else
+        cat > "$OUT" <<EOF
+<section class="host"><h2>${h} <span class="badge fail">SIN DATOS</span></h2>
+<p>No se pudo obtener el reporte por SSH (host caido, sin acceso, o el archivo ${REMOTE_FILE} no existe).</p></section>
+EOF
+        logger -t patch-puller "ERROR: no se pudo recoger el reporte de ${h}"
+    fi
+done
+
+/usr/local/sbin/build-report.py

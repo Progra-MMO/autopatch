@@ -1,0 +1,51 @@
+---
+# postfix como null-client / smarthost hacia smtp_server.
+# Soporta relay autenticado (SASL) y TLS opcional.
+
+- name: Instalar postfix y libs SASL
+  ansible.builtin.package:
+    name:
+      - postfix
+      - cyrus-sasl-plain
+    state: present
+
+- name: Configurar relayhost y modo null-client
+  ansible.builtin.command: >
+    postconf -e
+    "relayhost=[{{ smtp_server }}]:{{ smtp_port }}"
+    "inet_interfaces=loopback-only"
+    "mydestination="
+  changed_when: true
+
+- name: Configurar autenticacion SASL (si hay usuario)
+  when: smtp_username | length > 0
+  block:
+    - name: Crear mapa sasl_passwd
+      ansible.builtin.copy:
+        dest: /etc/postfix/sasl_passwd
+        mode: '0600'
+        content: "[{{ smtp_server }}]:{{ smtp_port }} {{ smtp_username }}:{{ smtp_password }}\n"
+      no_log: true
+
+    - name: Compilar mapa sasl_passwd
+      ansible.builtin.command: postmap /etc/postfix/sasl_passwd
+      changed_when: true
+
+    - name: Activar SASL en postfix
+      ansible.builtin.command: >
+        postconf -e
+        "smtp_sasl_auth_enable=yes"
+        "smtp_sasl_password_maps=hash:/etc/postfix/sasl_passwd"
+        "smtp_sasl_security_options=noanonymous"
+      changed_when: true
+
+- name: Activar TLS de salida (si corresponde)
+  ansible.builtin.command: >
+    postconf -e "smtp_tls_security_level={{ 'encrypt' if smtp_use_tls | bool else 'may' }}"
+  changed_when: true
+
+- name: Habilitar y reiniciar postfix
+  ansible.builtin.service:
+    name: postfix
+    enabled: true
+    state: restarted
